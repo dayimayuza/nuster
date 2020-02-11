@@ -22,6 +22,7 @@
 #ifndef _TYPES_APPLET_H
 #define _TYPES_APPLET_H
 
+#include <types/freq_ctr.h>
 #include <types/hlua.h>
 #include <types/obj_type.h>
 #include <types/proxy.h>
@@ -73,6 +74,7 @@ struct appctx {
 	struct buffer_wait buffer_wait; /* position in the list of objects waiting for a buffer */
 	unsigned long thread_mask;      /* mask of thread IDs authorized to process the applet */
 	struct task *t;                  /* task associated to the applet */
+	struct freq_ctr call_rate;       /* appctx call rate */
 
 	union {
 		union {
@@ -137,6 +139,7 @@ struct appctx {
 			struct cache_entry *entry;  /* Entry to be sent from cache. */
 			unsigned int sent;          /* The number of bytes already sent for this cache entry. */
 			unsigned int offset;        /* start offset of remaining data relative to beginning of the next block */
+			unsigned int rem_data;      /* Remaing bytes for the last data block (HTX only, 0 means process next block) */
 			struct shared_block *next;  /* The next block of data to be sent for this cache entry. */
 		} cache;
 		/* all entries below are used by various CLI commands, please
@@ -170,7 +173,7 @@ struct appctx {
 		} errors;
 		struct {
 			void *target;		/* table we want to dump, or NULL for all */
-			struct proxy *proxy;	/* table being currently dumped (first if NULL) */
+			struct stktable *t;	/* table being currently dumped (first if NULL) */
 			struct stksess *entry;	/* last entry we were trying to dump (or first if NULL) */
 			long long value;	/* value to compare against */
 			signed char data_type;	/* type of data to compare, or -1 if none */

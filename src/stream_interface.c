@@ -30,8 +30,10 @@
 #include <proto/applet.h>
 #include <proto/channel.h>
 #include <proto/connection.h>
+#include <proto/http_htx.h>
 #include <proto/mux_pt.h>
 #include <proto/pipe.h>
+#include <proto/proxy.h>
 #include <proto/stream.h>
 #include <proto/stream_interface.h>
 #include <proto/task.h>
@@ -168,13 +170,12 @@ static void stream_int_shutr(struct stream_interface *si)
 	struct channel *ic = si_ic(si);
 
 	si_rx_shut_blk(si);
-	ic->flags &= ~CF_SHUTR_NOW;
 	if (ic->flags & CF_SHUTR)
 		return;
 	ic->flags |= CF_SHUTR;
 	ic->rex = TICK_ETERNITY;
 
-	if (si->state != SI_ST_EST && si->state != SI_ST_CON)
+	if (!si_state_in(si->state, SI_SB_CON|SI_SB_RDY|SI_SB_EST))
 		return;
 
 	if (si_oc(si)->flags & CF_SHUTW) {
@@ -216,6 +217,7 @@ static void stream_int_shutw(struct stream_interface *si)
 	}
 
 	switch (si->state) {
+	case SI_ST_RDY:
 	case SI_ST_EST:
 		/* we have to shut before closing, otherwise some short messages
 		 * may never leave the system, especially when there are remaining
@@ -237,7 +239,6 @@ static void stream_int_shutw(struct stream_interface *si)
 	default:
 		si->flags &= ~SI_FL_NOLINGER;
 		si_rx_shut_blk(si);
-		ic->flags &= ~CF_SHUTR_NOW;
 		ic->flags |= CF_SHUTR;
 		ic->rex = TICK_ETERNITY;
 		si->exp = TICK_ETERNITY;
@@ -263,7 +264,7 @@ static void stream_int_chk_rcv(struct stream_interface *si)
 	}
 	else {
 		/* (re)start reading */
-		tasklet_wakeup(si->wait_event.task);
+		tasklet_wakeup(si->wait_event.tasklet);
 		if (!(si->flags & SI_FL_DONT_WAKE))
 			task_wakeup(si_task(si), TASK_WOKEN_IO);
 	}
@@ -339,7 +340,7 @@ int conn_si_send_proxy(struct connection *conn, unsigned int flag)
 	 * connection, in which case the connection is validated only once
 	 * we've sent the whole proxy line. Otherwise we use connect().
 	 */
-	while (conn->send_proxy_ofs) {
+	if (conn->send_proxy_ofs) {
 		const struct conn_stream *cs;
 		int ret;
 
@@ -414,7 +415,6 @@ int conn_si_send_proxy(struct connection *conn, unsigned int flag)
 			goto out_wait;
 
 		/* OK we've sent the whole line, we're connected */
-		break;
 	}
 
 	/* The connection is ready now, simply return and let the connection
@@ -423,7 +423,6 @@ int conn_si_send_proxy(struct connection *conn, unsigned int flag)
 	if (conn->flags & CO_FL_WAIT_L4_CONN)
 		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 	conn->flags &= ~flag;
-	__conn_sock_stop_send(conn);
 	return 1;
 
  out_error:
@@ -432,8 +431,6 @@ int conn_si_send_proxy(struct connection *conn, unsigned int flag)
 	return 0;
 
  out_wait:
-	__conn_sock_stop_recv(conn);
-	__conn_sock_want_send(conn);
 	return 0;
 }
 
@@ -541,7 +538,7 @@ static void stream_int_notify(struct stream_interface *si)
 	/* wake the task up only when needed */
 	if (/* changes on the production side */
 	    (ic->flags & (CF_READ_NULL|CF_READ_ERROR)) ||
-	    (si->state != SI_ST_EST && si->state != SI_ST_CON) ||
+	    !si_state_in(si->state, SI_SB_CON|SI_SB_RDY|SI_SB_EST) ||
 	    (si->flags & SI_FL_ERR) ||
 	    ((ic->flags & CF_READ_PARTIAL) &&
 	     ((ic->flags & CF_EOI) || !ic->to_forward || sio->state != SI_ST_EST)) ||
@@ -597,12 +594,14 @@ static int si_cs_process(struct conn_stream *cs)
 
 	/* First step, report to the stream-int what was detected at the
 	 * connection layer : errors and connection establishment.
-	 *
-	 * Note: This test is only required because si_cs_process is also the SI
-	 *       wake callback. Otherwise si_cs_recv()/si_cs_send() already take
-	 *       care of it.
+	 * Only add SI_FL_ERR if we're connected, or we're attempting to
+	 * connect, we may get there because we got woken up, but only run
+	 * after process_stream() noticed there were an error, and decided
+	 * to retry to connect, the connection may still have CO_FL_ERROR,
+	 * and we don't want to add SI_FL_ERR back
 	 */
-	if (conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR)
+	if (si->state >= SI_ST_CON &&
+	    (conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR))
 		si->flags |= SI_FL_ERR;
 
 	/* If we had early data, and the handshake ended, then
@@ -616,19 +615,16 @@ static int si_cs_process(struct conn_stream *cs)
 		task_wakeup(si_task(si), TASK_WOKEN_MSG);
 	}
 
-	if ((si->state < SI_ST_EST) &&
+	if (!si_state_in(si->state, SI_SB_EST|SI_SB_DIS|SI_SB_CLO) &&
 	    (conn->flags & (CO_FL_CONNECTED | CO_FL_HANDSHAKE)) == CO_FL_CONNECTED) {
 		si->exp = TICK_ETERNITY;
 		oc->flags |= CF_WRITE_NULL;
+		if (si->state == SI_ST_CON)
+			si->state = SI_ST_RDY;
 	}
 
 	/* Report EOI on the channel if it was reached from the mux point of
-	 * view.
-	 *
-	 * Note: This test is only required because si_cs_process is also the SI
-	 *       wake callback. Otherwise si_cs_recv()/si_cs_send() already take
-	 *       care of it.
-	 */
+	 * view. */
 	if ((cs->flags & CS_FL_EOI) && !(ic->flags & CF_EOI))
 		ic->flags |= (CF_EOI|CF_READ_PARTIAL);
 
@@ -656,14 +652,22 @@ int si_cs_send(struct conn_stream *cs)
 	int ret;
 	int did_send = 0;
 
-	/* We're already waiting to be able to send, give up */
-	if (si->wait_event.events & SUB_RETRY_SEND)
-		return 0;
-
 	if (conn->flags & CO_FL_ERROR || cs->flags & (CS_FL_ERROR|CS_FL_ERR_PENDING)) {
+		/* We're probably there because the tasklet was woken up,
+		 * but process_stream() ran before, detected there were an
+		 * error and put the si back to SI_ST_TAR. There's still
+		 * CO_FL_ERROR on the connection but we don't want to add
+		 * SI_FL_ERR back, so give up
+		 */
+		if (si->state < SI_ST_CON)
+			return 0;
 		si->flags |= SI_FL_ERR;
 		return 1;
 	}
+
+	/* We're already waiting to be able to send, give up */
+	if (si->wait_event.events & SUB_RETRY_SEND)
+		return 0;
 
 	/* we might have been called just after an asynchronous shutw */
 	if (conn->flags & CO_FL_SOCK_WR_SH || oc->flags & CF_SHUTW)
@@ -713,10 +717,38 @@ int si_cs_send(struct conn_stream *cs)
 		if (oc->flags & CF_STREAMER)
 			send_flag |= CO_SFL_STREAMER;
 
+		if ((si->flags & SI_FL_L7_RETRY) && !b_data(&si->l7_buffer)) {
+			struct stream *s = si_strm(si);
+			/* If we want to be able to do L7 retries, copy
+			 * the data we're about to send, so that we are able
+			 * to resend them if needed
+			 */
+			/* Try to allocate a buffer if we had none.
+			 * If it fails, the next test will just
+			 * disable the l7 retries by setting
+			 * l7_conn_retries to 0.
+			 */
+			if (!s->txn || (s->txn->req.msg_state != HTTP_MSG_DONE))
+				si->flags &= ~SI_FL_L7_RETRY;
+			else {
+				if (b_is_null(&si->l7_buffer))
+					b_alloc(&si->l7_buffer);
+				if (b_is_null(&si->l7_buffer))
+					si->flags &= ~SI_FL_L7_RETRY;
+				else {
+					memcpy(b_orig(&si->l7_buffer),
+					       b_orig(&oc->buf),
+					       b_size(&oc->buf));
+					si->l7_buffer.head = co_data(oc);
+					b_add(&si->l7_buffer, co_data(oc));
+				}
+
+			}
+		}
+
 		ret = cs->conn->mux->snd_buf(cs, &oc->buf, co_data(oc), send_flag);
 		if (ret > 0) {
 			did_send = 1;
-
 			co_set_data(oc, co_data(oc) - ret);
 			c_realign_if_empty(oc);
 
@@ -733,6 +765,9 @@ int si_cs_send(struct conn_stream *cs)
  end:
 	if (did_send) {
 		oc->flags |= CF_WRITE_PARTIAL | CF_WROTE_DATA;
+		if (si->state == SI_ST_CON)
+			si->state = SI_ST_RDY;
+
 		si_rx_room_rdy(si_opposite(si));
 	}
 
@@ -772,91 +807,135 @@ struct task *si_cs_io_cb(struct task *t, void *ctx, unsigned short state)
 }
 
 /* This function is designed to be called from within the stream handler to
- * update the channels' expiration timers and the stream interface's flags
- * based on the channels' flags. It needs to be called only once after the
- * channels' flags have settled down, and before they are cleared, though it
- * doesn't harm to call it as often as desired (it just slightly hurts
- * performance). It must not be called from outside of the stream handler,
- * as what it does will be used to compute the stream task's expiration.
+ * update the input channel's expiration timer and the stream interface's
+ * Rx flags based on the channel's flags. It needs to be called only once
+ * after the channel's flags have settled down, and before they are cleared,
+ * though it doesn't harm to call it as often as desired (it just slightly
+ * hurts performance). It must not be called from outside of the stream
+ * handler, as what it does will be used to compute the stream task's
+ * expiration.
  */
-void si_update(struct stream_interface *si)
+void si_update_rx(struct stream_interface *si)
 {
 	struct channel *ic = si_ic(si);
-	struct channel *oc = si_oc(si);
 
-	if (!(ic->flags & CF_SHUTR)) {
-		/* Read not closed, update FD status and timeout for reads */
-		if (ic->flags & CF_DONT_READ)
-			si_rx_chan_blk(si);
-		else
-			si_rx_chan_rdy(si);
-
-		if (!channel_is_empty(ic)) {
-			/* stop reading, imposed by channel's policy or contents */
-			si_rx_room_blk(si);
-		}
-		else {
-			/* (re)start reading and update timeout. Note: we don't recompute the timeout
-			 * everytime we get here, otherwise it would risk never to expire. We only
-			 * update it if is was not yet set. The stream socket handler will already
-			 * have updated it if there has been a completed I/O.
-			 */
-			si_rx_room_rdy(si);
-		}
-		if (si->flags & SI_FL_RXBLK_ANY & ~SI_FL_RX_WAIT_EP)
-			ic->rex = TICK_ETERNITY;
-		else if (!(ic->flags & CF_READ_NOEXP) && !tick_isset(ic->rex))
-			ic->rex = tick_add_ifset(now_ms, ic->rto);
-
-		si_chk_rcv(si);
-	}
-	else
+	if (ic->flags & CF_SHUTR) {
 		si_rx_shut_blk(si);
+		return;
+	}
 
-	if (!(oc->flags & CF_SHUTW)) {
-		/* Write not closed, update FD status and timeout for writes */
-		if (channel_is_empty(oc)) {
-			/* stop writing */
-			if (!(si->flags & SI_FL_WAIT_DATA)) {
-				if ((oc->flags & CF_SHUTW_NOW) == 0)
-					si->flags |= SI_FL_WAIT_DATA;
-				oc->wex = TICK_ETERNITY;
-			}
+	/* Read not closed, update FD status and timeout for reads */
+	if (ic->flags & CF_DONT_READ)
+		si_rx_chan_blk(si);
+	else
+		si_rx_chan_rdy(si);
+
+	if (!channel_is_empty(ic)) {
+		/* stop reading, imposed by channel's policy or contents */
+		si_rx_room_blk(si);
+	}
+	else {
+		/* (re)start reading and update timeout. Note: we don't recompute the timeout
+		 * everytime we get here, otherwise it would risk never to expire. We only
+		 * update it if is was not yet set. The stream socket handler will already
+		 * have updated it if there has been a completed I/O.
+		 */
+		si_rx_room_rdy(si);
+	}
+	if (si->flags & SI_FL_RXBLK_ANY & ~SI_FL_RX_WAIT_EP)
+		ic->rex = TICK_ETERNITY;
+	else if (!(ic->flags & CF_READ_NOEXP) && !tick_isset(ic->rex))
+		ic->rex = tick_add_ifset(now_ms, ic->rto);
+
+	si_chk_rcv(si);
+}
+
+/* This function is designed to be called from within the stream handler to
+ * update the output channel's expiration timer and the stream interface's
+ * Tx flags based on the channel's flags. It needs to be called only once
+ * after the channel's flags have settled down, and before they are cleared,
+ * though it doesn't harm to call it as often as desired (it just slightly
+ * hurts performance). It must not be called from outside of the stream
+ * handler, as what it does will be used to compute the stream task's
+ * expiration.
+ */
+void si_update_tx(struct stream_interface *si)
+{
+	struct channel *oc = si_oc(si);
+	struct channel *ic = si_ic(si);
+
+	if (oc->flags & CF_SHUTW)
+		return;
+
+	/* Write not closed, update FD status and timeout for writes */
+	if (channel_is_empty(oc)) {
+		/* stop writing */
+		if (!(si->flags & SI_FL_WAIT_DATA)) {
+			if ((oc->flags & CF_SHUTW_NOW) == 0)
+				si->flags |= SI_FL_WAIT_DATA;
+			oc->wex = TICK_ETERNITY;
 		}
-		else {
-			/* (re)start writing and update timeout. Note: we don't recompute the timeout
-			 * everytime we get here, otherwise it would risk never to expire. We only
-			 * update it if is was not yet set. The stream socket handler will already
-			 * have updated it if there has been a completed I/O.
+		return;
+	}
+
+	/* (re)start writing and update timeout. Note: we don't recompute the timeout
+	 * everytime we get here, otherwise it would risk never to expire. We only
+	 * update it if is was not yet set. The stream socket handler will already
+	 * have updated it if there has been a completed I/O.
+	 */
+	si->flags &= ~SI_FL_WAIT_DATA;
+	if (!tick_isset(oc->wex)) {
+		oc->wex = tick_add_ifset(now_ms, oc->wto);
+		if (tick_isset(ic->rex) && !(si->flags & SI_FL_INDEP_STR)) {
+			/* Note: depending on the protocol, we don't know if we're waiting
+			 * for incoming data or not. So in order to prevent the socket from
+			 * expiring read timeouts during writes, we refresh the read timeout,
+			 * except if it was already infinite or if we have explicitly setup
+			 * independent streams.
 			 */
-			si->flags &= ~SI_FL_WAIT_DATA;
-			if (!tick_isset(oc->wex)) {
-				oc->wex = tick_add_ifset(now_ms, oc->wto);
-				if (tick_isset(ic->rex) && !(si->flags & SI_FL_INDEP_STR)) {
-					/* Note: depending on the protocol, we don't know if we're waiting
-					 * for incoming data or not. So in order to prevent the socket from
-					 * expiring read timeouts during writes, we refresh the read timeout,
-					 * except if it was already infinite or if we have explicitly setup
-					 * independent streams.
-					 */
-					ic->rex = tick_add_ifset(now_ms, ic->rto);
-				}
-			}
+			ic->rex = tick_add_ifset(now_ms, ic->rto);
 		}
 	}
 }
 
-/* updates both stream ints of a same stream at once */
+/* perform a synchronous send() for the stream interface. The CF_WRITE_NULL and
+ * CF_WRITE_PARTIAL flags are cleared prior to the attempt, and will possibly
+ * be updated in case of success.
+ */
+void si_sync_send(struct stream_interface *si)
+{
+	struct channel *oc = si_oc(si);
+	struct conn_stream *cs;
+
+	oc->flags &= ~(CF_WRITE_NULL|CF_WRITE_PARTIAL);
+
+	if (oc->flags & CF_SHUTW)
+		return;
+
+	if (channel_is_empty(oc))
+		return;
+
+	if (!si_state_in(si->state, SI_SB_CON|SI_SB_RDY|SI_SB_EST))
+		return;
+
+	cs = objt_cs(si->end);
+	if (!cs)
+		return;
+
+	si_cs_send(cs);
+}
+
 /* Updates at once the channel flags, and timers of both stream interfaces of a
  * same stream, to complete the work after the analysers, then updates the data
  * layer below. This will ensure that any synchronous update performed at the
  * data layer will be reflected in the channel flags and/or stream-interface.
+ * Note that this does not change the stream interface's current state, though
+ * it updates the previous state to the current one.
  */
 void si_update_both(struct stream_interface *si_f, struct stream_interface *si_b)
 {
 	struct channel *req = si_ic(si_f);
 	struct channel *res = si_oc(si_f);
-	struct conn_stream *cs;
 
 	req->flags &= ~(CF_READ_NULL|CF_READ_PARTIAL|CF_READ_ATTACHED|CF_WRITE_NULL|CF_WRITE_PARTIAL);
 	res->flags &= ~(CF_READ_NULL|CF_READ_PARTIAL|CF_READ_ATTACHED|CF_WRITE_NULL|CF_WRITE_PARTIAL);
@@ -864,35 +943,11 @@ void si_update_both(struct stream_interface *si_f, struct stream_interface *si_b
 	si_f->prev_state = si_f->state;
 	si_b->prev_state = si_b->state;
 
-	/* front stream-int */
-	cs = objt_cs(si_f->end);
-	if (cs &&
-	    si_f->state == SI_ST_EST &&
-	    !(res->flags & CF_SHUTW) && /* Write not closed */
-	    !channel_is_empty(res) &&
-	    !(cs->flags & CS_FL_ERROR) &&
-	    !(cs->conn->flags & CO_FL_ERROR)) {
-		if (si_cs_send(cs))
-			si_rx_room_rdy(si_b);
-	}
-
-	/* back stream-int */
-	cs = objt_cs(si_b->end);
-	if (cs &&
-	    (si_b->state == SI_ST_EST || si_b->state == SI_ST_CON) &&
-	    !(req->flags & CF_SHUTW) && /* Write not closed */
-	    !channel_is_empty(req) &&
-	    !(cs->flags & (CS_FL_ERROR|CS_FL_ERR_PENDING)) &&
-	    !(cs->conn->flags & CO_FL_ERROR)) {
-		if (si_cs_send(cs))
-			si_rx_room_rdy(si_f);
-	}
-
 	/* let's recompute both sides states */
-	if (si_f->state == SI_ST_EST)
+	if (si_state_in(si_f->state, SI_SB_RDY|SI_SB_EST))
 		si_update(si_f);
 
-	if (si_b->state == SI_ST_EST)
+	if (si_state_in(si_b->state, SI_SB_RDY|SI_SB_EST))
 		si_update(si_b);
 
 	/* stream ints are processed outside of process_stream() and must be
@@ -925,13 +980,12 @@ static void stream_int_shutr_conn(struct stream_interface *si)
 	struct channel *ic = si_ic(si);
 
 	si_rx_shut_blk(si);
-	ic->flags &= ~CF_SHUTR_NOW;
 	if (ic->flags & CF_SHUTR)
 		return;
 	ic->flags |= CF_SHUTR;
 	ic->rex = TICK_ETERNITY;
 
-	if (si->state != SI_ST_EST && si->state != SI_ST_CON)
+	if (!si_state_in(si->state, SI_SB_CON|SI_SB_RDY|SI_SB_EST))
 		return;
 
 	if (si->flags & SI_FL_KILL_CONN)
@@ -976,6 +1030,7 @@ static void stream_int_shutw_conn(struct stream_interface *si)
 	}
 
 	switch (si->state) {
+	case SI_ST_RDY:
 	case SI_ST_EST:
 		/* we have to shut before closing, otherwise some short messages
 		 * may never leave the system, especially when there are remaining
@@ -1032,7 +1087,6 @@ static void stream_int_shutw_conn(struct stream_interface *si)
 	default:
 		si->flags &= ~SI_FL_NOLINGER;
 		si_rx_shut_blk(si);
-		ic->flags &= ~CF_SHUTR_NOW;
 		ic->flags |= CF_SHUTR;
 		ic->rex = TICK_ETERNITY;
 		si->exp = TICK_ETERNITY;
@@ -1048,8 +1102,8 @@ static void stream_int_shutw_conn(struct stream_interface *si)
 static void stream_int_chk_rcv_conn(struct stream_interface *si)
 {
 	/* (re)start reading */
-	if (si->state == SI_ST_CON || si->state == SI_ST_EST)
-		tasklet_wakeup(si->wait_event.task);
+	if (si_state_in(si->state, SI_SB_CON|SI_SB_RDY|SI_SB_EST))
+		tasklet_wakeup(si->wait_event.tasklet);
 }
 
 
@@ -1063,7 +1117,7 @@ static void stream_int_chk_snd_conn(struct stream_interface *si)
 	struct channel *oc = si_oc(si);
 	struct conn_stream *cs = __objt_cs(si->end);
 
-	if (unlikely((si->state != SI_ST_CON && si->state != SI_ST_EST) ||
+	if (unlikely(!si_state_in(si->state, SI_SB_CON|SI_SB_RDY|SI_SB_EST) ||
 	    (oc->flags & CF_SHUTW)))
 		return;
 
@@ -1079,7 +1133,8 @@ static void stream_int_chk_snd_conn(struct stream_interface *si)
 
 	if (cs->flags & (CS_FL_ERROR|CS_FL_ERR_PENDING) || cs->conn->flags & CO_FL_ERROR) {
 		/* Write error on the file descriptor */
-		si->flags |= SI_FL_ERR;
+		if (si->state >= SI_ST_CON)
+			si->flags |= SI_FL_ERR;
 		goto out_wakeup;
 	}
 
@@ -1094,7 +1149,7 @@ static void stream_int_chk_snd_conn(struct stream_interface *si)
 		 */
 		if (((oc->flags & (CF_SHUTW|CF_AUTO_CLOSE|CF_SHUTW_NOW)) ==
 		     (CF_AUTO_CLOSE|CF_SHUTW_NOW)) &&
-		    (si->state == SI_ST_EST)) {
+		    si_state_in(si->state, SI_SB_RDY|SI_SB_EST)) {
 			si_shutw(si);
 			goto out_wakeup;
 		}
@@ -1139,7 +1194,7 @@ static void stream_int_chk_snd_conn(struct stream_interface *si)
 	if (likely((oc->flags & (CF_WRITE_NULL|CF_WRITE_ERROR|CF_SHUTW)) ||
 	          ((oc->flags & CF_WAKE_WRITE) &&
 	           ((channel_is_empty(oc) && !oc->to_forward) ||
-	            si->state != SI_ST_EST)))) {
+	            !si_state_in(si->state, SI_SB_EST))))) {
 	out_wakeup:
 		if (!(si->flags & SI_FL_DONT_WAKE))
 			task_wakeup(si_task(si), TASK_WOKEN_IO);
@@ -1176,7 +1231,7 @@ int si_cs_recv(struct conn_stream *cs)
 
 	/* stop here if we reached the end of data */
 	if (cs->flags & CS_FL_EOS)
-		goto end_recv;
+		goto out_shutdown_r;
 
 	/* stop immediately on errors. Note that we DON'T want to stop on
 	 * POLL_ERR, as the poller might report a write error while there
@@ -1188,7 +1243,7 @@ int si_cs_recv(struct conn_stream *cs)
 		if (!conn_xprt_ready(conn))
 			return 0;
 		if (conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR)
-			goto end_recv;
+			return 1; // We want to make sure si_cs_wake() is called, so that process_strema is woken up, on failure
 	}
 
 	/* prepare to detect if the mux needs more room */
@@ -1244,8 +1299,11 @@ int si_cs_recv(struct conn_stream *cs)
 			ic->flags |= CF_READ_PARTIAL;
 		}
 
-		if (conn->flags & CO_FL_ERROR || cs->flags & (CS_FL_EOS|CS_FL_ERROR))
-			goto end_recv;
+		if (cs->flags & CS_FL_EOS)
+			goto out_shutdown_r;
+
+		if (conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR)
+			return 1;
 
 		if (conn->flags & CO_FL_WAIT_ROOM) {
 			/* the pipe is full or we have read enough data that it
@@ -1284,10 +1342,7 @@ int si_cs_recv(struct conn_stream *cs)
 		 * CS_FL_RCV_MORE on the CS if more space is needed.
 		 */
 		max = channel_recv_max(ic);
-		ret = cs->conn->mux->rcv_buf(cs, &ic->buf, max,
-		          flags |
-		          (co_data(ic) ? CO_RFL_BUF_WET : 0) |
-		          ((channel_recv_limit(ic) < b_size(&ic->buf)) ? CO_RFL_KEEP_RSV : 0));
+		ret = cs->conn->mux->rcv_buf(cs, &ic->buf, max, flags | (co_data(ic) ? CO_RFL_BUF_WET : 0));
 
 		if (cs->flags & CS_FL_WANT_ROOM)
 			si_rx_room_blk(si);
@@ -1302,6 +1357,27 @@ int si_cs_recv(struct conn_stream *cs)
 			break;
 		}
 
+		if (si->flags & SI_FL_L7_RETRY) {
+			struct htx *htx;
+			struct htx_sl *sl;
+
+			htx = htxbuf(&ic->buf);
+			if (htx) {
+				sl = http_get_stline(htx);
+				if (sl && l7_status_match(si_strm(si)->be,
+				    sl->info.res.status)) {
+					/* If we got a status for which we would
+					 * like to retry the request, empty
+					 * the buffer and pretend there's an
+					 * error on the channel.
+					 */
+					ic->flags |= CF_READ_ERROR;
+					htx_reset(htx);
+					return 1;
+				}
+			}
+			si->flags &= ~SI_FL_L7_RETRY;
+		}
 		cur_read += ret;
 
 		/* if we're allowed to directly forward data, we must update ->o */
@@ -1397,40 +1473,32 @@ int si_cs_recv(struct conn_stream *cs)
 	}
 
  end_recv:
-	ret = (cur_read != 0);
+	if (conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR)
+		return 1;
 
-	/* Report EOI on the channel if it was reached from the mux point of
-	 * view. */
-	if ((cs->flags & CS_FL_EOI) && !(ic->flags & CF_EOI)) {
-		ic->flags |= (CF_EOI|CF_READ_PARTIAL);
-		ret = 1;
-	}
-
-	if (conn->flags & CO_FL_ERROR || cs->flags & CS_FL_ERROR) {
-		cs->flags |= CS_FL_ERROR;
-		si->flags |= SI_FL_ERR;
-		ret = 1;
-	}
-	else if (cs->flags & CS_FL_EOS) {
+	if (cs->flags & CS_FL_EOS)
 		/* connection closed */
-		if (conn->flags & CO_FL_CONNECTED) {
-			/* we received a shutdown */
-			ic->flags |= CF_READ_NULL;
-			if (ic->flags & CF_AUTO_CLOSE)
-				channel_shutw_now(ic);
-			stream_int_read0(si);
-		}
-		ret = 1;
-	}
-	else if (!si_rx_blocked(si)) {
-		/* Subscribe to receive events if we're blocking on I/O */
+		goto out_shutdown_r;
+
+	/* Subscribe to receive events if we're blocking on I/O */
+	if (!si_rx_blocked(si)) {
 		conn->mux->subscribe(cs, SUB_RETRY_RECV, &si->wait_event);
 		si_rx_endp_done(si);
 	} else {
 		si_rx_endp_more(si);
-		ret = 1;
 	}
-	return ret;
+
+	return (cur_read != 0) || si_rx_blocked(si) || (cs->flags & CS_FL_EOI);
+
+ out_shutdown_r:
+	if (conn->flags & CO_FL_CONNECTED) {
+		/* we received a shutdown */
+		ic->flags |= CF_READ_NULL;
+		if (ic->flags & CF_AUTO_CLOSE)
+			channel_shutw_now(ic);
+		stream_int_read0(si);
+	}
+	return 1;
 }
 
 /*
@@ -1445,13 +1513,12 @@ static void stream_int_read0(struct stream_interface *si)
 	struct channel *oc = si_oc(si);
 
 	si_rx_shut_blk(si);
-	ic->flags &= ~CF_SHUTR_NOW;
 	if (ic->flags & CF_SHUTR)
 		return;
 	ic->flags |= CF_SHUTR;
 	ic->rex = TICK_ETERNITY;
 
-	if (si->state != SI_ST_EST && si->state != SI_ST_CON)
+	if (!si_state_in(si->state, SI_SB_CON|SI_SB_RDY|SI_SB_EST))
 		return;
 
 	if (oc->flags & CF_SHUTW)
@@ -1529,7 +1596,6 @@ static void stream_int_shutr_applet(struct stream_interface *si)
 	struct channel *ic = si_ic(si);
 
 	si_rx_shut_blk(si);
-	ic->flags &= ~CF_SHUTR_NOW;
 	if (ic->flags & CF_SHUTR)
 		return;
 	ic->flags |= CF_SHUTR;
@@ -1537,7 +1603,7 @@ static void stream_int_shutr_applet(struct stream_interface *si)
 
 	/* Note: on shutr, we don't call the applet */
 
-	if (si->state != SI_ST_EST && si->state != SI_ST_CON)
+	if (!si_state_in(si->state, SI_SB_CON|SI_SB_RDY|SI_SB_EST))
 		return;
 
 	if (si_oc(si)->flags & CF_SHUTW) {
@@ -1579,6 +1645,7 @@ static void stream_int_shutw_applet(struct stream_interface *si)
 	appctx_wakeup(si_appctx(si));
 
 	switch (si->state) {
+	case SI_ST_RDY:
 	case SI_ST_EST:
 		/* we have to shut before closing, otherwise some short messages
 		 * may never leave the system, especially when there are remaining
@@ -1601,7 +1668,6 @@ static void stream_int_shutw_applet(struct stream_interface *si)
 	default:
 		si->flags &= ~SI_FL_NOLINGER;
 		si_rx_shut_blk(si);
-		ic->flags &= ~CF_SHUTR_NOW;
 		ic->flags |= CF_SHUTR;
 		ic->rex = TICK_ETERNITY;
 		si->exp = TICK_ETERNITY;

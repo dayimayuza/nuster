@@ -28,6 +28,7 @@
 #include <nuster/http.h>
 
 static int _nst_cache_filter_init(struct proxy *px, struct flt_conf *fconf) {
+    fconf->flags |= FLT_CFG_FL_HTX;
     return 0;
 }
 
@@ -42,9 +43,24 @@ static void _nst_cache_filter_deinit(struct proxy *px, struct flt_conf *fconf) {
 }
 
 static int _nst_cache_filter_check(struct proxy *px, struct flt_conf *fconf) {
+    struct proxy *p;
 
     if(px->mode != PR_MODE_HTTP) {
         ha_warning("Proxy [%s]: mode should be http to enable cache\n", px->id);
+    }
+
+    for (p = proxies_list; p; p = p->next) {
+
+        if(p->nuster.mode == px->nuster.mode) {
+
+            if((px->options2 & PR_O2_USE_HTX)
+                    != (p->options2 & PR_O2_USE_HTX)) {
+
+                ha_alert("nuster cache: either use HTX or no HTX.\n");
+
+                return 1;
+            }
+        }
     }
 
     return 0;
@@ -123,7 +139,7 @@ static void _nst_cache_filter_detach(struct stream *s, struct filter *filter) {
     }
 }
 
-static int _nst_cache_filter_http_headers(struct stream *s,
+static int _nst_cache_filter_http_headers1(struct stream *s,
         struct filter *filter, struct http_msg *msg) {
 
     struct channel *req         = msg->chn;
@@ -178,7 +194,7 @@ static int _nst_cache_filter_http_headers(struct stream *s,
                 /* check if cache exists  */
                 nst_debug("[nuster][cache] Checking key existence: ");
 
-                ctx->state = nst_cache_exists(ctx, rule->disk);
+                ctx->state = nst_cache_exists(ctx, rule);
 
                 if(ctx->state == NST_CACHE_CTX_STATE_HIT) {
                     int ret;
@@ -387,6 +403,402 @@ abort_check:
     return 1;
 }
 
+static void nst_res_304_2(struct stream *s, struct nst_str *last_modified,
+        struct nst_str *etag) {
+
+    struct channel *res = &s->res;
+    struct htx *htx = htx_from_buf(&res->buf);
+    struct htx_sl *sl;
+    struct ist code;
+    int status;
+    unsigned int flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11);
+    size_t data;
+
+    status = 304;
+    code = ist("304");
+
+    sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/1.1"), code,
+            ist("Not Modified"));
+
+    if(!sl) {
+        goto fail;
+    }
+
+    sl->info.res.status = status;
+    s->txn->status = status;
+
+    if(!htx_add_header(htx, ist("Last-Modified"),
+                ist2(last_modified->data, last_modified->len)) ||
+            !htx_add_header(htx, ist("ETag"), ist2(etag->data, etag->len))) {
+
+        goto fail;
+    }
+
+    if(!htx_add_endof(htx, HTX_BLK_EOH)) {
+        goto fail;
+    }
+
+    if(!htx_add_endof(htx, HTX_BLK_EOM)) {
+        goto fail;
+    }
+
+    data = htx->data - co_data(res);
+    c_adv(res, data);
+    res->total += data;
+
+    channel_auto_read(&s->req);
+    channel_abort(&s->req);
+    channel_auto_close(&s->req);
+    channel_htx_erase(&s->req, htxbuf(&s->req.buf));
+
+    res->wex = tick_add_ifset(now_ms, res->wto);
+    channel_auto_read(res);
+    channel_auto_close(res);
+    channel_shutr_now(res);
+    return;
+
+fail:
+    channel_htx_truncate(res, htx);
+}
+
+static void nst_res_412_2(struct stream *s) {
+
+    struct channel *res = &s->res;
+    struct htx *htx = htx_from_buf(&res->buf);
+    struct htx_sl *sl;
+    struct ist code, body;
+    int status;
+    unsigned int flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11);
+    size_t data;
+
+    status = 412;
+    code = ist("412");
+    body = ist("412 Precondition Failed");
+
+    sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/1.1"), code,
+            ist("Precondition Failed"));
+
+    if(!sl) {
+        goto fail;
+    }
+
+    sl->info.res.status = status;
+    s->txn->status = status;
+
+    if(!htx_add_header(htx, ist("Content-Length"), ist("23"))) {
+        goto fail;
+    }
+
+    if(!htx_add_endof(htx, HTX_BLK_EOH)) {
+        goto fail;
+    }
+
+    while(body.len) {
+        size_t sent = htx_add_data(htx, body);
+
+        if(!sent) {
+            goto fail;
+        }
+
+        body.ptr += sent;
+        body.len -= sent;
+    }
+
+    if(!htx_add_endof(htx, HTX_BLK_EOM)) {
+        goto fail;
+    }
+
+    data = htx->data - co_data(res);
+    c_adv(res, data);
+    res->total += data;
+
+    channel_auto_read(&s->req);
+    channel_abort(&s->req);
+    channel_auto_close(&s->req);
+    channel_htx_erase(&s->req, htxbuf(&s->req.buf));
+
+    res->wex = tick_add_ifset(now_ms, res->wto);
+    channel_auto_read(res);
+    channel_auto_close(res);
+    channel_shutr_now(res);
+    return;
+
+fail:
+    channel_htx_truncate(res, htx);
+}
+
+static int _nst_cache_filter_http_headers2(struct stream *s,
+        struct filter *filter, struct http_msg *msg) {
+
+    struct channel *req         = msg->chn;
+    struct channel *res         = &s->res;
+    struct proxy *px            = s->be;
+    struct stream_interface *si = &s->si[1];
+    struct nst_cache_ctx *ctx   = filter->ctx;
+    struct nst_rule *rule       = NULL;
+
+    if(!(msg->chn->flags & CF_ISRESP)) {
+
+        /* check http method */
+        if(s->txn->meth == HTTP_METH_OTHER) {
+            ctx->state = NST_CACHE_CTX_STATE_BYPASS;
+        }
+
+        /* request */
+        if(ctx->state == NST_CACHE_CTX_STATE_INIT) {
+
+            if(nst_cache_prebuild_key2(ctx, s, msg) != NST_OK) {
+                ctx->state = NST_CACHE_CTX_STATE_BYPASS;
+                return 1;
+            }
+
+            list_for_each_entry(rule, &px->nuster.rules, list) {
+                nst_debug("[nuster][cache] Checking rule: %s\n", rule->name);
+
+                /* disabled? */
+                if(*rule->state == NST_RULE_DISABLED) {
+                    continue;
+                }
+
+                /* build key */
+                if(nst_cache_build_key2(ctx, rule->key, s, msg) != NST_OK) {
+                    ctx->state = NST_CACHE_CTX_STATE_BYPASS;
+                    return 1;
+                }
+
+                nst_debug("[nuster][cache] Key: ");
+                nst_debug_key(ctx->key);
+
+                ctx->hash = nst_hash(ctx->key->area, ctx->key->data);
+
+                nst_debug("[nuster][cache] Hash: %"PRIu64"\n", ctx->hash);
+
+                /* stash key */
+                if(!nst_cache_stash_rule(ctx, rule)) {
+                    ctx->state = NST_CACHE_CTX_STATE_BYPASS;
+                    return 1;
+                }
+
+                /* check if cache exists  */
+                nst_debug("[nuster][cache] Checking key existence: ");
+
+                ctx->state = nst_cache_exists(ctx, rule);
+
+                if(ctx->state == NST_CACHE_CTX_STATE_HIT) {
+                    int ret;
+
+                    nst_debug("EXIST\n[nuster][cache] Hit memory\n");
+                    /* OK, cache exists */
+
+                    ret = nst_cache_handle_conditional_req(ctx, rule, s, msg);
+
+                    if(ret == 304) {
+                        nst_res_304_2(s, &ctx->res.last_modified,
+                                &ctx->res.etag);
+
+                        return 1;
+                    }
+
+                    if(ret == 412) {
+                        nst_res_412_2(s);
+
+                        return 1;
+                    }
+
+                    break;
+                }
+
+                if(ctx->state == NST_CACHE_CTX_STATE_HIT_DISK) {
+                    int ret;
+
+                    nst_debug("EXIST\n[nuster][cache] Hit disk\n");
+                    /* OK, cache exists */
+
+                    if(rule->etag == NST_STATUS_ON) {
+                        ctx->res.etag.len  =
+                            nst_persist_meta_get_etag_len(ctx->disk.meta);
+
+                        ctx->res.etag.data =
+                            nst_cache_memory_alloc(ctx->res.etag.len);
+
+                        if(!ctx->res.etag.data) {
+                            goto abort_check;
+                        }
+
+                        if(nst_persist_get_etag(ctx->disk.fd, ctx->disk.meta,
+                                    &ctx->res.etag) != NST_OK) {
+
+                            goto abort_check;
+                        }
+                    }
+
+                    if(rule->last_modified == NST_STATUS_ON) {
+                        ctx->res.last_modified.len  =
+                            nst_persist_meta_get_last_modified_len(
+                                    ctx->disk.meta);
+
+                        ctx->res.last_modified.data =
+                            nst_cache_memory_alloc(ctx->res.last_modified.len);
+
+                        if(!ctx->res.last_modified.data) {
+                            goto abort_check;
+                        }
+
+                        if(nst_persist_get_last_modified(ctx->disk.fd,
+                                    ctx->disk.meta, &ctx->res.last_modified)
+                                != NST_OK) {
+
+                            goto abort_check;
+                        }
+                    }
+
+                    ret = nst_cache_handle_conditional_req(ctx, rule, s, msg);
+
+                    if(ret == 304) {
+                        nst_res_304(si, &ctx->res.last_modified,
+                                &ctx->res.etag);
+
+                        return 1;
+                    }
+
+                    if(ret == 412) {
+                        nst_res_412(si);
+
+                        return 1;
+                    }
+
+abort_check:
+                    if(ctx->res.etag.data) {
+                        nst_cache_memory_free(ctx->res.etag.data);
+                    }
+
+                    if(ctx->res.last_modified.data) {
+                        nst_cache_memory_free(ctx->res.last_modified.data);
+                    }
+
+                    break;
+                }
+
+                nst_debug("NOT EXIST\n");
+                /* no, there's no cache yet */
+
+                /* test acls to see if we should cache it */
+                nst_debug("[nuster][cache] Checking if rule pass: ");
+
+                if(nst_test_rule(rule, s, msg->chn->flags & CF_ISRESP) ==
+                        NST_OK) {
+
+                    nst_debug("PASS\n");
+                    ctx->state = NST_CACHE_CTX_STATE_PASS;
+                    ctx->rule  = rule;
+                    break;
+                }
+
+                nst_debug("FAIL\n");
+            }
+        }
+
+        if(ctx->state == NST_CACHE_CTX_STATE_HIT) {
+            nst_cache_hit(s, si, req, res, ctx->data);
+        }
+
+        if(ctx->state == NST_CACHE_CTX_STATE_HIT_DISK) {
+            nst_cache_hit_disk(s, si, req, res, ctx);
+        }
+
+    } else {
+        /* response */
+
+        if(ctx->state == NST_CACHE_CTX_STATE_INIT) {
+
+            list_for_each_entry(rule, &px->nuster.rules, list) {
+                nst_debug("[nuster][cache] Checking if rule pass: ");
+
+                /* test acls to see if we should cache it */
+                if(nst_test_rule(rule, s, msg->chn->flags & CF_ISRESP) ==
+                        NST_OK) {
+
+                    nst_debug("PASS\n");
+                    ctx->state = NST_CACHE_CTX_STATE_PASS;
+                    ctx->rule  = rule;
+                    break;
+                }
+
+                nst_debug("FAIL\n");
+            }
+        }
+
+        if(ctx->state == NST_CACHE_CTX_STATE_PASS) {
+            struct nst_rule_stash *stash = ctx->stash;
+            struct nst_rule_code *cc     = ctx->rule->code;
+
+            int valid = 0;
+
+            ctx->pid = px->uuid;
+
+            /* check if code is valid */
+            nst_debug("[nuster][cache] Checking status code: ");
+
+            if(!cc) {
+                valid = 1;
+            }
+
+            while(cc) {
+
+                if(cc->code == s->txn->status) {
+                    valid = 1;
+                    break;
+                }
+
+                cc = cc->next;
+            }
+
+            if(!valid) {
+                nst_debug("FAIL\n");
+                return 1;
+            }
+
+            /* get cache key */
+            while(stash) {
+
+                if(ctx->stash->rule == ctx->rule) {
+                    ctx->key  = stash->key;
+                    ctx->hash = stash->hash;
+                    stash->key = NULL;
+                    break;
+                }
+
+                stash = stash->next;
+            }
+
+            if(!ctx->key) {
+                return 1;
+            }
+
+            nst_cache_build_etag(ctx, s, msg);
+
+            nst_cache_build_last_modified(ctx, s, msg);
+
+            ctx->header_len = msg->sov;
+            nst_debug("PASS\n[nuster][cache] To create\n");
+
+            /* start to build cache */
+            nst_cache_create2(ctx, msg);
+        }
+    }
+
+    return 1;
+}
+
+static int _nst_cache_filter_http_headers(struct stream *s,
+        struct filter *filter, struct http_msg *msg) {
+    if (IS_HTX_STRM(s)) {
+        return _nst_cache_filter_http_headers2(s, filter, msg);
+    } else {
+        return _nst_cache_filter_http_headers1(s, filter, msg);
+    }
+}
+
 static int _nst_cache_filter_http_forward_data(struct stream *s,
         struct filter *filter, struct http_msg *msg, unsigned int len) {
 
@@ -408,6 +820,35 @@ static int _nst_cache_filter_http_forward_data(struct stream *s,
         }
 
         if(nst_cache_update(ctx, msg, ret) != NST_OK) {
+            goto err;
+        }
+    }
+
+    return ret;
+
+err:
+    ctx->entry->state = NST_CACHE_ENTRY_STATE_INVALID;
+    ctx->entry->data  = NULL;
+    ctx->state        = NST_CACHE_CTX_STATE_BYPASS;
+    return ret;
+}
+
+static int _nst_cache_filter_http_payload(struct stream *s,
+        struct filter *filter, struct http_msg *msg, unsigned int offset,
+        unsigned int len) {
+
+    struct nst_cache_ctx *ctx = filter->ctx;
+
+    int ret = len;
+
+    if(len <= 0) {
+        return 0;
+    }
+
+    if(ctx->state == NST_CACHE_CTX_STATE_CREATE
+            && (msg->chn->flags & CF_ISRESP)) {
+
+        if(nst_cache_update2(ctx, msg, offset, ret) != NST_OK) {
             goto err;
         }
     }
@@ -446,6 +887,7 @@ struct flt_ops nst_cache_filter_ops = {
 
     /* Filter HTTP requests and responses */
     .http_headers      = _nst_cache_filter_http_headers,
+    .http_payload      = _nst_cache_filter_http_payload,
     .http_forward_data = _nst_cache_filter_http_forward_data,
     .http_end          = _nst_cache_filter_http_end,
 

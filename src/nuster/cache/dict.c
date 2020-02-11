@@ -236,6 +236,8 @@ struct nst_cache_entry *nst_cache_dict_set(struct nst_cache_ctx *ctx) {
         return NULL;
     }
 
+    memset(entry, 0, sizeof(*entry));
+
     if(ctx->rule->disk != NST_DISK_ONLY) {
         data = nst_cache_data_new();
 
@@ -261,6 +263,12 @@ struct nst_cache_entry *nst_cache_dict_set(struct nst_cache_ctx *ctx) {
     entry->rule   = ctx->rule;
     entry->pid    = ctx->pid;
     entry->file   = NULL;
+    entry->ttl    = *ctx->rule->ttl;
+
+    entry->extend[0] = ctx->rule->extend[0];
+    entry->extend[1] = ctx->rule->extend[1];
+    entry->extend[2] = ctx->rule->extend[2];
+    entry->extend[3] = ctx->rule->extend[3];
 
     entry->header_len = ctx->header_len;
 
@@ -304,16 +312,47 @@ struct nst_cache_entry *nst_cache_dict_get(struct buffer *key, uint64_t hash) {
                     && entry->key->data == key->data
                     && !memcmp(entry->key->area, key->area, key->data)) {
 
+                int expired = nst_cache_entry_expired(entry);
+
+                uint64_t max = 1000 * entry->expire + 1000 * entry->ttl
+                    * entry->extend[3] / 100;
+
+                entry->atime = get_current_timestamp();
+
+                if(expired && entry->extend[0] != 0xFF && entry->atime <= max
+                        && entry->access[3] > entry->access[2]
+                        && entry->access[2] > entry->access[1]) {
+
+                    entry->expire    += entry->ttl;
+
+                    entry->access[0] += entry->access[1];
+                    entry->access[0] += entry->access[2];
+                    entry->access[0] += entry->access[3];
+                    entry->access[1]  = 0;
+                    entry->access[2]  = 0;
+                    entry->access[3]  = 0;
+                    entry->extended  += 1;
+
+                    if(entry->file) {
+                        nst_persist_update_expire(entry->file, entry->expire);
+                    }
+
+                    expired = 0;
+                }
+
                 /* check expire
                  * change state only, leave the free stuff to cleanup
                  * */
-                if(entry->state == NST_CACHE_ENTRY_STATE_VALID
-                        && nst_cache_entry_expired(entry)) {
-
+                if(entry->state == NST_CACHE_ENTRY_STATE_VALID && expired) {
                     entry->state         = NST_CACHE_ENTRY_STATE_EXPIRED;
                     entry->data->invalid = 1;
                     entry->data          = NULL;
                     entry->expire        = 0;
+                    entry->access[0]     = 0;
+                    entry->access[1]     = 0;
+                    entry->access[2]     = 0;
+                    entry->access[3]     = 0;
+                    entry->extended      = 0;
 
                     return NULL;
                 }
@@ -340,6 +379,8 @@ int nst_cache_dict_set_from_disk(char *file, char *meta, struct buffer *key,
     struct nst_cache_entry *entry = NULL;
     int idx;
     uint64_t hash = nst_persist_meta_get_hash(meta);
+
+    uint64_t ttl_extend = nst_persist_meta_get_ttl_extend(meta);
 
     dict = _nst_cache_dict_rehashing()
         ? &nuster.cache->dict[1] : &nuster.cache->dict[0];
@@ -378,6 +419,13 @@ int nst_cache_dict_set_from_disk(char *file, char *meta, struct buffer *key,
 
     entry->path.data  = path->data;
     entry->path.len   = path->len;
+
+    entry->extend[0] = *( uint8_t *)(&ttl_extend);
+    entry->extend[1] = *((uint8_t *)(&ttl_extend) + 1);
+    entry->extend[2] = *((uint8_t *)(&ttl_extend) + 2);
+    entry->extend[3] = *((uint8_t *)(&ttl_extend) + 3);
+
+    entry->ttl = ttl_extend >> 32;
 
     return NST_OK;
 }

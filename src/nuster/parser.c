@@ -892,6 +892,8 @@ int nst_parse_proxy_rule(char **args, int section, struct proxy *proxy,
 
     int last_modified = -1;
 
+    uint8_t extend[4] = { -1 };
+
     int cur_arg = 2;
 
     if(proxy == defpx || !(proxy->cap & PR_CAP_BE)) {
@@ -1086,6 +1088,87 @@ int nst_parse_proxy_rule(char **args, int section, struct proxy *proxy,
             continue;
         }
 
+        if(!strcmp(args[cur_arg], "extend")) {
+
+            if(extend[0] != 0xFF) {
+                memprintf(err, "'%s %s': extend already specified.",
+                        args[0], name);
+
+                goto out;
+            }
+
+            cur_arg++;
+            if(*args[cur_arg] == 0) {
+                memprintf(err, "'%s rule %s': `extend` expects "
+                        "[on|off|N1,N2,N3,N4], default off.", args[0], name);
+
+                goto out;
+            }
+
+            if(!strcmp(args[cur_arg], "on")) {
+                extend[0] = extend[1] = extend[2] = extend[3] = 33;
+            } else if(!strcmp(args[cur_arg], "off")) {
+                extend[0] = extend[1] = extend[2] = extend[3] = 0;
+            } else {
+                char *tmp = strdup(args[cur_arg]);
+                char *ptr = tmp;
+                char *next;
+
+                int t, i = 0;
+
+                while(tmp != NULL) {
+                    strsep(&ptr, ",");
+                    t = strtol(tmp, &next, 10);
+
+                    if(t < 0 || t > 100) {
+                        memprintf(err, "'%s rule %s': `extend` expects "
+                                "positive integer between 0 and 100", args[0],
+                                name);
+
+                        goto out;
+                    }
+
+                    extend[i++ % 4] = t;
+
+                    if((next == tmp) || (*next != '\0')) {
+                        memprintf(err, "'%s rule %s': `extend` expects "
+                                "[on|off|N1,N2,N3,N4], default off.",
+                                args[0], name);
+
+                        goto out;
+                    }
+
+                    tmp = ptr;
+                }
+
+                if(i != 4) {
+                    memprintf(err, "'%s rule %s': `extend` expects "
+                            "[on|off|N1,N2,N3,N4], default off.",
+                            args[0], name);
+
+                    goto out;
+                }
+
+                if(extend[0] + extend[1] + extend[2] > 100) {
+                    memprintf(err, "'%s rule %s': `extend`: N1 + N2 + N3 must "
+                            "be less than or equal to 100", args[0], name);
+
+                    goto out;
+                }
+
+                if(extend[3] <= 0 || extend[3] > 100) {
+                    memprintf(err, "'%s rule %s': `extend`: N4 must be between"
+                            " 0 and 100", args[0], name);
+
+                    goto out;
+                }
+
+            }
+
+            cur_arg++;
+            continue;
+        }
+
         memprintf(err, "'%s %s': Unrecognized '%s'.", args[0], name,
                 args[cur_arg]);
         goto out;
@@ -1138,6 +1221,16 @@ int nst_parse_proxy_rule(char **args, int section, struct proxy *proxy,
     rule->etag = etag == -1 ? NST_STATUS_OFF : etag;
 
     rule->last_modified = last_modified == -1 ? NST_STATUS_OFF : last_modified;
+
+    if(extend[0] == 0xFF) {
+        rule->extend[0] = rule->extend[1] = 0;
+        rule->extend[2] = rule->extend[3] = 0;
+    } else {
+        rule->extend[0] = extend[0];
+        rule->extend[1] = extend[1];
+        rule->extend[2] = extend[2];
+        rule->extend[3] = extend[3];
+    }
 
     rule->id   = -1;
     LIST_INIT(&rule->list);

@@ -25,6 +25,7 @@
 
 #include <types/applet.h>
 #include <types/cli.h>
+#include <types/dict.h>
 #include <types/global.h>
 #include <types/cli.h>
 #include <types/dns.h>
@@ -54,6 +55,19 @@ static int srv_set_fqdn(struct server *srv, const char *fqdn, int dns_locked);
 /* List head of all known server keywords */
 static struct srv_kw_list srv_keywords = {
 	.list = LIST_HEAD_INIT(srv_keywords.list)
+};
+
+__decl_hathreads(HA_SPINLOCK_T idle_conn_srv_lock);
+struct eb_root idle_conn_srv = EB_ROOT;
+struct task *idle_conn_task = NULL;
+struct task *idle_conn_cleanup[MAX_THREADS] = { NULL };
+struct list toremove_connections[MAX_THREADS];
+__decl_hathreads(HA_SPINLOCK_T toremove_lock[MAX_THREADS]);
+
+/* The server names dictionary */
+struct dict server_name_dict = {
+	.name = "server names",
+	.values = EB_ROOT_UNIQUE,
 };
 
 int srv_downtime(const struct server *s)
@@ -320,6 +334,14 @@ static int srv_parse_check_send_proxy(char **args, int *cur_arg,
 	return 0;
 }
 
+/* Parse the "check-via-socks4" server keyword */
+static int srv_parse_check_via_socks4(char **args, int *cur_arg,
+                                      struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	newsrv->check.via_socks4 = 1;
+	return 0;
+}
+
 /* Parse the "cookie" server keyword */
 static int srv_parse_cookie(char **args, int *cur_arg,
                             struct proxy *curproxy, struct server *newsrv, char **err)
@@ -387,7 +409,17 @@ static int srv_parse_pool_purge_delay(char **args, int *cur_arg, struct proxy *c
 		return ERR_ALERT | ERR_FATAL;
 	}
 	res = parse_time_err(arg, &time, TIME_UNIT_MS);
-	if (res) {
+	if (res == PARSE_TIME_OVER) {
+		memprintf(err, "timer overflow in argument '%s' to '%s' (maximum value is 2147483647 ms or ~24.8 days)",
+			  args[*cur_arg+1], args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	else if (res == PARSE_TIME_UNDER) {
+		memprintf(err, "timer underflow in argument '%s' to '%s' (minimum non-null value is 1 ms)",
+			  args[*cur_arg+1], args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	else if (res) {
 		memprintf(err, "unexpected character '%c' in argument to <%s>.\n",
 		    *res, args[*cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
@@ -452,7 +484,7 @@ static int srv_parse_id(char **args, int *cur_arg, struct proxy *curproxy, struc
 static int srv_parse_namespace(char **args, int *cur_arg,
                                struct proxy *curproxy, struct server *newsrv, char **err)
 {
-#ifdef CONFIG_HAP_NS
+#ifdef USE_NS
 	char *arg;
 
 	arg = args[*cur_arg + 1];
@@ -529,7 +561,7 @@ static int srv_parse_no_check_send_proxy(char **args, int *cur_arg,
 }
 
 /* Disable server PROXY protocol flags. */
-static int inline srv_disable_pp_flags(struct server *srv, unsigned int flags)
+static inline int srv_disable_pp_flags(struct server *srv, unsigned int flags)
 {
 	srv->pp_opts &= ~flags;
 	return 0;
@@ -549,6 +581,14 @@ static int srv_parse_no_send_proxy_v2(char **args, int *cur_arg,
 	return srv_disable_pp_flags(newsrv, SRV_PP_V2);
 }
 
+/* Parse the "no-tfo" server keyword */
+static int srv_parse_no_tfo(char **args, int *cur_arg,
+                            struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	newsrv->flags &= ~SRV_F_FASTOPEN;
+	return 0;
+}
+
 /* Parse the "non-stick" server keyword */
 static int srv_parse_non_stick(char **args, int *cur_arg,
                                struct proxy *curproxy, struct server *newsrv, char **err)
@@ -558,7 +598,7 @@ static int srv_parse_non_stick(char **args, int *cur_arg,
 }
 
 /* Enable server PROXY protocol flags. */
-static int inline srv_enable_pp_flags(struct server *srv, unsigned int flags)
+static inline int srv_enable_pp_flags(struct server *srv, unsigned int flags)
 {
 	srv->pp_opts |= flags;
 	return 0;
@@ -886,6 +926,62 @@ static int srv_parse_track(char **args, int *cur_arg,
 	return 0;
 }
 
+/* Parse the "socks4" server keyword */
+static int srv_parse_socks4(char **args, int *cur_arg,
+                            struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	char *errmsg;
+	int port_low, port_high;
+	struct sockaddr_storage *sk;
+	struct protocol *proto;
+
+	errmsg = NULL;
+
+	if (!*args[*cur_arg + 1]) {
+		memprintf(err, "'%s' expects <addr>:<port> as argument.\n", args[*cur_arg]);
+		goto err;
+	}
+
+	/* 'sk' is statically allocated (no need to be freed). */
+	sk = str2sa_range(args[*cur_arg + 1], NULL, &port_low, &port_high, &errmsg, NULL, NULL, 1);
+	if (!sk) {
+		memprintf(err, "'%s %s' : %s\n", args[*cur_arg], args[*cur_arg + 1], errmsg);
+		goto err;
+	}
+
+	proto = protocol_by_family(sk->ss_family);
+	if (!proto || !proto->connect) {
+		ha_alert("'%s %s' : connect() not supported for this address family.\n", args[*cur_arg], args[*cur_arg + 1]);
+		goto err;
+	}
+
+	newsrv->flags |= SRV_F_SOCKS4_PROXY;
+	newsrv->socks4_addr = *sk;
+
+	if (port_low != port_high) {
+		ha_alert("'%s' does not support port offsets (found '%s').\n", args[*cur_arg], args[*cur_arg + 1]);
+		goto err;
+	}
+
+	if (!port_low) {
+		ha_alert("'%s': invalid port range %d-%d.\n", args[*cur_arg], port_low, port_high);
+		goto err;
+	}
+
+	return 0;
+
+ err:
+	free(errmsg);
+	return ERR_ALERT | ERR_FATAL;
+}
+
+
+/* parse the "tfo" server keyword */
+static int srv_parse_tfo(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->flags |= SRV_F_FASTOPEN;
+	return 0;
+}
 
 /* Shutdown all connections of a server. The caller must pass a termination
  * code in <why>, which must be one of SF_ERR_* indicating the reason for the
@@ -1264,6 +1360,7 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "no-check-send-proxy", srv_parse_no_check_send_proxy, 0,  1 }, /* disable PROXY protol for health checks */
 	{ "no-send-proxy",       srv_parse_no_send_proxy,       0,  1 }, /* Disable use of PROXY V1 protocol */
 	{ "no-send-proxy-v2",    srv_parse_no_send_proxy_v2,    0,  1 }, /* Disable use of PROXY V2 protocol */
+	{ "no-tfo",              srv_parse_no_tfo,              0,  1 }, /* Disable use of TCP Fast Open */
 	{ "non-stick",           srv_parse_non_stick,           0,  1 }, /* Disable stick-table persistence */
 	{ "observe",             srv_parse_observe,             1,  1 }, /* Enables health adjusting based on observing communication with the server */
 	{ "pool-max-conn",       srv_parse_pool_max_conn,       1,  1 }, /* Set the max number of orphan idle connections, 0 means unlimited */
@@ -1275,7 +1372,10 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "send-proxy-v2",       srv_parse_send_proxy_v2,       0,  1 }, /* Enforce use of PROXY V2 protocol */
 	{ "source",              srv_parse_source,             -1,  1 }, /* Set the source address to be used to connect to the server */
 	{ "stick",               srv_parse_stick,               0,  1 }, /* Enable stick-table persistence */
+	{ "tfo",                 srv_parse_tfo,                 0,  1 }, /* enable TCP Fast Open of server */
 	{ "track",               srv_parse_track,               1,  1 }, /* Set the current state of the server, tracking another one */
+	{ "socks4",              srv_parse_socks4,              1,  1 }, /* Set the socks4 proxy of the server*/
+	{ "check-via-socks4",    srv_parse_check_via_socks4,    0,  1 }, /* enable socks4 proxy for health checks */
 	{ NULL, NULL, 0 },
 }};
 
@@ -1534,7 +1634,7 @@ static void srv_ssl_settings_cpy(struct server *srv, struct server *src)
 		srv->ssl_ctx.verify_host = strdup(src->ssl_ctx.verify_host);
 	if (src->ssl_ctx.ciphers != NULL)
 		srv->ssl_ctx.ciphers = strdup(src->ssl_ctx.ciphers);
-#if (OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined OPENSSL_IS_BORINGSSL && !defined LIBRESSL_VERSION_NUMBER)
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined OPENSSL_IS_BORINGSSL)
 	if (src->ssl_ctx.ciphersuites != NULL)
 		srv->ssl_ctx.ciphersuites = strdup(src->ssl_ctx.ciphersuites);
 #endif
@@ -1711,6 +1811,9 @@ static void srv_settings_cpy(struct server *srv, struct server *src, int srv_tmp
 
 	if (srv_tmpl)
 		srv->srvrq = src->srvrq;
+
+	srv->check.via_socks4         = src->check.via_socks4;
+	srv->socks4_addr              = src->socks4_addr;
 }
 
 struct server *new_server(struct proxy *proxy)
@@ -1739,10 +1842,9 @@ struct server *new_server(struct proxy *proxy)
 	srv->agent.proxy = proxy;
 	srv->xprt  = srv->check.xprt = srv->agent.xprt = xprt_get(XPRT_RAW);
 
-	srv->pool_purge_delay = 1000;
-	srv->max_idle_conns = -1;
-	srv->max_reuse = -1;
-
+	/* please don't put default server settings here, they are set in
+	 * init_default_instance().
+	 */
 	return srv;
 }
 
@@ -2045,7 +2147,7 @@ static int server_template_init(struct server *srv, struct proxy *px)
 	return i - srv->tmpl_info.nb_low;
 }
 
-int parse_server(const char *file, int linenum, char **args, struct proxy *curproxy, struct proxy *defproxy)
+int parse_server(const char *file, int linenum, char **args, struct proxy *curproxy, struct proxy *defproxy, int parse_addr)
 {
 	struct server *newsrv = NULL;
 	const char *err = NULL;
@@ -2055,11 +2157,12 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 	char *fqdn = NULL;
 
 	if (!strcmp(args[0], "server")         ||
+	    !strcmp(args[0], "peer")           ||
 	    !strcmp(args[0], "default-server") ||
 	    !strcmp(args[0], "server-template")) {
 		int cur_arg;
 		int defsrv = (*args[0] == 'd');
-		int srv = !defsrv && !strcmp(args[0], "server");
+		int srv = !defsrv && (*args[0] == 'p' || !strcmp(args[0], "server"));
 		int srv_tmpl = !defsrv && !srv;
 		int tmpl_range_low = 0, tmpl_range_high = 0;
 
@@ -2072,7 +2175,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			err_code |= ERR_WARN;
 
 		/* There is no mandatory first arguments for default server. */
-		if (srv) {
+		if (srv && parse_addr) {
 			if (!*args[2]) {
 				/* 'server' line number of argument check. */
 				ha_alert("parsing [%s:%d] : '%s' expects <name> and <addr>[:<port>] as arguments.\n",
@@ -2152,6 +2255,9 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			 *  - IP:+N => port=+N, relative
 			 *  - IP:-N => port=-N, relative
 			 */
+			if (!parse_addr)
+				goto skip_addr;
+
 			sk = str2sa_range(args[cur_arg], &port, &port1, &port2, &errmsg, NULL, &fqdn, 0);
 			if (!sk) {
 				ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
@@ -2208,10 +2314,11 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 				goto out;
 			}
 
+			cur_arg++;
+ skip_addr:
 			/* Copy default server settings to new server settings. */
 			srv_settings_cpy(newsrv, &curproxy->defsrv, 0);
 			HA_SPIN_INIT(&newsrv->lock);
-			cur_arg++;
 		} else {
 			newsrv = &curproxy->defsrv;
 			cur_arg = 1;
@@ -2222,7 +2329,20 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 		while (*args[cur_arg]) {
 			if (!strcmp(args[cur_arg], "agent-inter")) {
 				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
+
+				if (err == PARSE_TIME_OVER) {
+					ha_alert("parsing [%s:%d]: timer overflow in argument <%s> to <%s> of server %s, maximum value is 2147483647 ms (~24.8 days).\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err == PARSE_TIME_UNDER) {
+					ha_alert("parsing [%s:%d]: timer underflow in argument <%s> to <%s> of server %s, minimum non-null value is 1 ms.\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err) {
 					ha_alert("parsing [%s:%d] : unexpected character '%c' in 'agent-inter' argument of server %s.\n",
 					      file, linenum, *err, newsrv->id);
 					err_code |= ERR_ALERT | ERR_FATAL;
@@ -2447,7 +2567,20 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			}
 			else if (!strcmp(args[cur_arg], "inter")) {
 				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
+
+				if (err == PARSE_TIME_OVER) {
+					ha_alert("parsing [%s:%d]: timer overflow in argument <%s> to <%s> of server %s, maximum value is 2147483647 ms (~24.8 days).\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err == PARSE_TIME_UNDER) {
+					ha_alert("parsing [%s:%d]: timer underflow in argument <%s> to <%s> of server %s, minimum non-null value is 1 ms.\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err) {
 					ha_alert("parsing [%s:%d] : unexpected character '%c' in 'inter' argument of server %s.\n",
 					      file, linenum, *err, newsrv->id);
 					err_code |= ERR_ALERT | ERR_FATAL;
@@ -2464,7 +2597,20 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			}
 			else if (!strcmp(args[cur_arg], "fastinter")) {
 				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
+
+				if (err == PARSE_TIME_OVER) {
+					ha_alert("parsing [%s:%d]: timer overflow in argument <%s> to <%s> of server %s, maximum value is 2147483647 ms (~24.8 days).\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err == PARSE_TIME_UNDER) {
+					ha_alert("parsing [%s:%d]: timer underflow in argument <%s> to <%s> of server %s, minimum non-null value is 1 ms.\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err) {
 					ha_alert("parsing [%s:%d]: unexpected character '%c' in 'fastinter' argument of server %s.\n",
 					      file, linenum, *err, newsrv->id);
 					err_code |= ERR_ALERT | ERR_FATAL;
@@ -2481,7 +2627,20 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			}
 			else if (!strcmp(args[cur_arg], "downinter")) {
 				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
+
+				if (err == PARSE_TIME_OVER) {
+					ha_alert("parsing [%s:%d]: timer overflow in argument <%s> to <%s> of server %s, maximum value is 2147483647 ms (~24.8 days).\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err == PARSE_TIME_UNDER) {
+					ha_alert("parsing [%s:%d]: timer underflow in argument <%s> to <%s> of server %s, minimum non-null value is 1 ms.\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err) {
 					ha_alert("parsing [%s:%d]: unexpected character '%c' in 'downinter' argument of server %s.\n",
 					      file, linenum, *err, newsrv->id);
 					err_code |= ERR_ALERT | ERR_FATAL;
@@ -2528,7 +2687,20 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			else if (!strcmp(args[cur_arg], "slowstart")) {
 				/* slowstart is stored in seconds */
 				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
+
+				if (err == PARSE_TIME_OVER) {
+					ha_alert("parsing [%s:%d]: timer overflow in argument <%s> to <%s> of server %s, maximum value is 2147483647 ms (~24.8 days).\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err == PARSE_TIME_UNDER) {
+					ha_alert("parsing [%s:%d]: timer underflow in argument <%s> to <%s> of server %s, minimum non-null value is 1 ms.\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err) {
 					ha_alert("parsing [%s:%d] : unexpected character '%c' in 'slowstart' argument of server %s.\n",
 					      file, linenum, *err, newsrv->id);
 					err_code |= ERR_ALERT | ERR_FATAL;
@@ -3226,7 +3398,7 @@ void apply_server_state(void)
 	int mybuflen;
 	char *params[SRV_STATE_FILE_MAX_FIELDS] = {0};
 	char *srv_params[SRV_STATE_FILE_MAX_FIELDS] = {0};
-	int arg, srv_arg, version, diff;
+	int arg, srv_arg, version;
 	FILE *f;
 	char *filepath;
 	char globalfilepath[MAXPATHLEN + 1];
@@ -3471,7 +3643,6 @@ void apply_server_state(void)
 					break;
 			}
 
-			diff = 0;
 			bk = curproxy;
 
 			/* if backend can't be found, let's continue */
@@ -3490,27 +3661,15 @@ void apply_server_state(void)
 					continue;
 			}
 
-			/* look for the server by its id: param[2] */
-			/* else look for the server by its name: param[3] */
-			diff = 0;
-			srv = server_find_best_match(bk, params[3], atoi(params[2]), &diff);
+			/* look for the server by its name: param[3] */
+			srv = server_find_best_match(bk, params[3], 0, NULL);
 
 			if (!srv) {
 				/* if no server found, then warning and continue with next line */
-				ha_warning("can't find server '%s' with id '%s' in backend with id '%s' or name '%s'\n",
-					   params[3], params[2], params[0], params[1]);
-				send_log(bk, LOG_NOTICE, "can't find server '%s' with id '%s' in backend with id '%s' or name '%s'\n",
-					 params[3], params[2], params[0], params[1]);
-				continue;
-			}
-			else if (diff & PR_FBM_MISMATCH_ID) {
-				ha_warning("In backend '%s' (id: '%d'): server ID mismatch: from server state file: '%s', from running config %d\n", bk->id, bk->uuid, params[2], srv->puid);
-				send_log(bk, LOG_NOTICE, "In backend '%s' (id: %d): server ID mismatch: from server state file: '%s', from running config %d\n", bk->id, bk->uuid, params[2], srv->puid);
-				continue;
-			}
-			else if (diff & PR_FBM_MISMATCH_NAME) {
-				ha_warning("In backend '%s' (id: %d): server name mismatch: from server state file: '%s', from running config '%s'\n", bk->id, bk->uuid, params[3], srv->id);
-				send_log(bk, LOG_NOTICE, "In backend '%s' (id: %d): server name mismatch: from server state file: '%s', from running config '%s'\n", bk->id, bk->uuid, params[3], srv->id);
+				ha_warning("can't find server '%s' in backend '%s'\n",
+					   params[3], params[1]);
+				send_log(bk, LOG_NOTICE, "can't find server '%s' in backend '%s'\n",
+					 params[3], params[1]);
 				continue;
 			}
 
@@ -5304,27 +5463,122 @@ static void srv_update_status(struct server *s)
 	*s->adm_st_chg_cause = 0;
 }
 
-struct task *srv_cleanup_idle_connections(struct task *task, void *context, unsigned short state)
+struct task *srv_cleanup_toremove_connections(struct task *task, void *context, unsigned short state)
 {
-	struct server *srv = context;
-	struct connection *conn, *conn_back;
-	unsigned int to_destroy = srv->curr_idle_thr[tid] / 2 + (srv->curr_idle_thr[tid] & 1);
-	unsigned int i = 0;
+	struct connection *conn;
 
-
-
-	list_for_each_entry_safe(conn, conn_back, &srv->idle_orphan_conns[tid], list) {
-		if (i == to_destroy)
-			break;
-		conn->mux->destroy(conn);
-		i++;
+	while ((conn = LIST_POP_LOCKED(&toremove_connections[tid],
+	                               struct connection *, list)) != NULL) {
+		conn->mux->destroy(conn->ctx);
 	}
-	if (!LIST_ISEMPTY(&srv->idle_orphan_conns[tid]))
-		task_schedule(task, tick_add(now_ms, srv->pool_purge_delay));
-	else
-		task->expire = TICK_ETERNITY;
+
 	return task;
 }
+
+struct task *srv_cleanup_idle_connections(struct task *task, void *context, unsigned short state)
+{
+	struct server *srv;
+	struct eb32_node *eb;
+	int i;
+	unsigned int next_wakeup;
+	int need_wakeup = 0;
+
+	HA_SPIN_LOCK(OTHER_LOCK, &idle_conn_srv_lock);
+	while (1) {
+		int srv_is_empty = 1;
+
+		eb = eb32_lookup_ge(&idle_conn_srv, now_ms - TIMER_LOOK_BACK);
+		if (!eb) {
+			/* we might have reached the end of the tree, typically because
+			 * <now_ms> is in the first half and we're first scanning the last
+			* half. Let's loop back to the beginning of the tree now.
+			*/
+
+			eb = eb32_first(&idle_conn_srv);
+			if (likely(!eb))
+				break;
+		}
+		if (tick_is_lt(now_ms, eb->key)) {
+			/* timer not expired yet, revisit it later */
+			next_wakeup = eb->key;
+			need_wakeup = 1;
+			break;
+		}
+		srv = eb32_entry(eb, struct server, idle_node);
+		for (i = 0; i < global.nbthread; i++) {
+			int max_conn = (srv->curr_idle_thr[i] / 2) +
+			    (srv->curr_idle_thr[i] & 1);
+			int j;
+			int did_remove = 0;
+
+			HA_SPIN_LOCK(OTHER_LOCK, &toremove_lock[i]);
+			for (j = 0; j < max_conn; j++) {
+				struct connection *conn = LIST_POP_LOCKED(&srv->idle_orphan_conns[i], struct connection *, list);
+				if (!conn)
+					break;
+				did_remove = 1;
+				LIST_ADDQ_LOCKED(&toremove_connections[i], &conn->list);
+			}
+			HA_SPIN_UNLOCK(OTHER_LOCK, &toremove_lock[i]);
+			if (did_remove && max_conn < srv->curr_idle_thr[i])
+				srv_is_empty = 0;
+			if (did_remove)
+				task_wakeup(idle_conn_cleanup[i], TASK_WOKEN_OTHER);
+		}
+		eb32_delete(&srv->idle_node);
+		if (!srv_is_empty) {
+			/* There are still more idle connections, add the
+			 * server back in the tree.
+			 */
+			srv->idle_node.key = tick_add(srv->pool_purge_delay,
+			    now_ms);
+			eb32_insert(&idle_conn_srv, &srv->idle_node);
+		}
+	}
+	HA_SPIN_UNLOCK(OTHER_LOCK, &idle_conn_srv_lock);
+
+	if (need_wakeup)
+		task->expire = next_wakeup;
+	else
+		task->expire = TICK_ETERNITY;
+
+	return task;
+}
+
+/* config parser for global "tune.pool-{low,high}-fd-ratio" */
+static int cfg_parse_pool_fd_ratio(char **args, int section_type, struct proxy *curpx,
+                                   struct proxy *defpx, const char *file, int line,
+                                   char **err)
+{
+	int arg = -1;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (*(args[1]) != 0)
+		arg = atoi(args[1]);
+
+	if (arg < 0 || arg > 100) {
+		memprintf(err, "'%s' expects an integer argument between 0 and 100.", args[0]);
+		return -1;
+	}
+
+	if (args[0][10] == 'h')
+		global.tune.pool_high_ratio = arg;
+	else
+		global.tune.pool_low_ratio = arg;
+	return 0;
+}
+
+/* config keyword parsers */
+static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "tune.pool-high-fd-ratio",     cfg_parse_pool_fd_ratio },
+	{ CFG_GLOBAL, "tune.pool-low-fd-ratio",      cfg_parse_pool_fd_ratio },
+	{ 0, NULL, NULL }
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
+
 /*
  * Local variables:
  *  c-indent-level: 8

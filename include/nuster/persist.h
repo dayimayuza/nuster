@@ -30,13 +30,13 @@
 
 #include <nuster/common.h>
 
-#define NST_PERSIST_VERSION  3
+#define NST_PERSIST_VERSION  4
 
 /*
    Offset              Length(bytes)           Content
    0                   6                       NUSTER
-   6                   1                       Mode: NUSTER_DISK_*, 1, 2, 3
-   7                   1                       Version: 1
+   6                   1                       mode: NUSTER_DISK_*, 1, 2, 3
+   7                   1                       version
    8 * 1               8                       hash
    8 * 2               8                       expire time
    8 * 3               8                       cache length
@@ -46,17 +46,14 @@
    8 * 7               8                       path length
    8 * 8               8                       etag length
    8 * 9               8                       last-modified length
-   8 * 10              key_len                 key
-   8 * 11              host_len                host
-   8 * 12              path_len                path
-   8 * 13              etag_len                etag
-   8 * 14              last_modified_len       last_modified
-   meta_size
-   + key_len
-   + host_len
-   + path_len
-   + etag_len
-   + last_modified      cache_len       cache
+   8 * 10              8                       ttl: 4, extend: 4
+   8 * 11              40                      reserved
+   8 * 16              key_len                 key
+   + key_len           host_len                host
+   + host_len          path_len                path
+   + path_len          etag_len                etag
+   + etag_len          last_modified_len       last_modified
+   + last_modified_len cache_len               cache
  */
 
 #define NST_PERSIST_META_POS_HASH               8 * 1
@@ -68,16 +65,18 @@
 #define NST_PERSIST_META_POS_PATH_LEN           8 * 7
 #define NST_PERSIST_META_POS_ETAG_LEN           8 * 8
 #define NST_PERSIST_META_POS_LAST_MODIFIED_LEN  8 * 9
+#define NST_PERSIST_META_POS_TTL_EXTEND         8 * 10
 
 
-#define NST_PERSIST_META_SIZE                8 * 10
-#define NST_PERSIST_POS_KEY                  NST_PERSIST_META_SIZE
+#define NST_PERSIST_META_SIZE                   8 * 16
+#define NST_PERSIST_POS_KEY                     NST_PERSIST_META_SIZE
 
 enum {
     NST_PERSIST_APPLET_ERROR   = -1,
     NST_PERSIST_APPLET_DONE    =  0,
     NST_PERSIST_APPLET_HEADER,
     NST_PERSIST_APPLET_PAYLOAD,
+    NST_PERSIST_APPLET_EOM,
 };
 
 struct persist {
@@ -199,6 +198,14 @@ static inline uint64_t nst_persist_meta_get_last_modified_len(char *p) {
     return *(uint64_t *)(p + NST_PERSIST_META_POS_LAST_MODIFIED_LEN);
 }
 
+static inline void nst_persist_meta_set_ttl_extend(char *p, uint64_t v) {
+    *(uint64_t *)(p + NST_PERSIST_META_POS_TTL_EXTEND) = v;
+}
+
+static inline uint64_t nst_persist_meta_get_ttl_extend(char *p) {
+    return *(uint64_t *)(p + NST_PERSIST_META_POS_TTL_EXTEND);
+}
+
 static inline int nst_persist_get_header_pos(char *p) {
     return (int)(NST_PERSIST_META_SIZE + nst_persist_meta_get_key_len(p)
             + nst_persist_meta_get_host_len(p)
@@ -211,7 +218,7 @@ static inline void
 nst_persist_meta_init(char *p, char mode, uint64_t hash, uint64_t expire,
         uint64_t cache_len, uint64_t header_len, uint64_t key_len,
         uint64_t host_len, uint64_t path_len, uint64_t etag_len,
-        uint64_t last_modified_len) {
+        uint64_t last_modified_len, uint64_t ttl_extend) {
 
     memcpy(p, "NUSTER", 6);
     p[6] = mode;
@@ -226,6 +233,7 @@ nst_persist_meta_init(char *p, char mode, uint64_t hash, uint64_t expire,
     nst_persist_meta_set_path_len(p, path_len);
     nst_persist_meta_set_etag_len(p, etag_len);
     nst_persist_meta_set_last_modified_len(p, last_modified_len);
+    nst_persist_meta_set_ttl_extend(p, ttl_extend);
 }
 
 int nst_persist_exists(char *root, struct persist *disk, struct buffer *key,
@@ -313,5 +321,6 @@ int nst_persist_valid(struct persist *disk, struct buffer *key, uint64_t hash);
 int nst_persist_purge_by_key(char *root, struct persist *disk,
         struct buffer *key, uint64_t hash);
 int nst_persist_purge_by_path(char *path);
+void nst_persist_update_expire(char *file, uint64_t expire);
 
 #endif /* _NUSTER_PERSIST_H */

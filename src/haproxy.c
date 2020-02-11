@@ -703,7 +703,7 @@ void mworker_reload()
 		next_argv[next_argc++] = "-sf";
 
 		list_for_each_entry(child, &proc_list, list) {
-			if (!(child->options & (PROC_O_TYPE_WORKER|PROC_O_TYPE_PROG)))
+			if (!(child->options & (PROC_O_TYPE_WORKER|PROC_O_TYPE_PROG)) || child->pid <= -1 )
 				continue;
 			next_argv[next_argc] = memprintf(&msg, "%d", child->pid);
 			if (next_argv[next_argc] == NULL)
@@ -747,12 +747,16 @@ static void mworker_loop()
 
 	master = 1;
 
+	signal_unregister(SIGTTIN);
+	signal_unregister(SIGTTOU);
 	signal_unregister(SIGUSR1);
 	signal_unregister(SIGHUP);
 	signal_unregister(SIGQUIT);
 
 	signal_register_fct(SIGTERM, mworker_catch_sigterm, SIGTERM);
 	signal_register_fct(SIGUSR1, mworker_catch_sigterm, SIGUSR1);
+	signal_register_fct(SIGTTIN, mworker_broadcast_signal, SIGTTIN);
+	signal_register_fct(SIGTTOU, mworker_broadcast_signal, SIGTTOU);
 	signal_register_fct(SIGINT, mworker_catch_sigterm, SIGINT);
 	signal_register_fct(SIGHUP, mworker_catch_sighup, SIGHUP);
 	signal_register_fct(SIGUSR2, mworker_catch_sighup, SIGUSR2);
@@ -1036,7 +1040,7 @@ static int get_old_sockets(const char *unixsocket)
 			   unixsocket);
 		goto out;
 	}
-	strncpy(addr.sun_path, unixsocket, sizeof(addr.sun_path));
+	strncpy(addr.sun_path, unixsocket, sizeof(addr.sun_path) - 1);
 	addr.sun_path[sizeof(addr.sun_path) - 1] = 0;
 	addr.sun_family = PF_UNIX;
 	ret = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
@@ -2980,31 +2984,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* try our best to re-enable core dumps depending on system capabilities.
-	 * What is addressed here :
-	 *   - remove file size limits
-	 *   - remove core size limits
-	 *   - mark the process dumpable again if it lost it due to user/group
-	 */
-	if (global.tune.options & GTUNE_SET_DUMPABLE) {
-		limit.rlim_cur = limit.rlim_max = RLIM_INFINITY;
-
-#if defined(RLIMIT_FSIZE)
-		if (setrlimit(RLIMIT_FSIZE, &limit) == -1)
-			ha_warning("[%s.main()] Failed to set the raise the maximum file size.\n", argv[0]);
-#endif
-
-#if defined(RLIMIT_CORE)
-		if (setrlimit(RLIMIT_CORE, &limit) == -1)
-			ha_warning("[%s.main()] Failed to set the raise the core dump size.\n", argv[0]);
-#endif
-
-#if defined(USE_PRCTL)
-		if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) == -1)
-			ha_warning("[%s.main()] Failed to set the dumpable flag, no core will be dumped.\n", argv[0]);
-#endif
-	}
-
 	/* check ulimits */
 	limit.rlim_cur = limit.rlim_max = 0;
 	getrlimit(RLIMIT_NOFILE, &limit);
@@ -3285,6 +3264,31 @@ int main(int argc, char **argv)
 		if (!(global.mode & MODE_MWORKER)) /* in mworker mode we don't want a new pgid for the children */
 			setsid();
 		fork_poller();
+	}
+
+	/* try our best to re-enable core dumps depending on system capabilities.
+	 * What is addressed here :
+	 *   - remove file size limits
+	 *   - remove core size limits
+	 *   - mark the process dumpable again if it lost it due to user/group
+	 */
+	if (global.tune.options & GTUNE_SET_DUMPABLE) {
+		limit.rlim_cur = limit.rlim_max = RLIM_INFINITY;
+
+#if defined(RLIMIT_FSIZE)
+		if (setrlimit(RLIMIT_FSIZE, &limit) == -1)
+			ha_warning("[%s.main()] Failed to set the raise the maximum file size.\n", argv[0]);
+#endif
+
+#if defined(RLIMIT_CORE)
+		if (setrlimit(RLIMIT_CORE, &limit) == -1)
+			ha_warning("[%s.main()] Failed to set the raise the core dump size.\n", argv[0]);
+#endif
+
+#if defined(USE_PRCTL)
+		if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) == -1)
+			ha_warning("[%s.main()] Failed to set the dumpable flag, no core will be dumped.\n", argv[0]);
+#endif
 	}
 
 	global.mode &= ~MODE_STARTING;

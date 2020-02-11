@@ -2239,6 +2239,7 @@ static struct task *process_chk_conn(struct task *t, void *context, unsigned sho
 		b_reset(&check->bi);
 		b_reset(&check->bo);
 
+		task_set_affinity(t, tid_bit);
 		ret = connect_conn_chk(t);
 		cs = check->cs;
 		conn = cs_conn(cs);
@@ -2270,7 +2271,6 @@ static struct task *process_chk_conn(struct task *t, void *context, unsigned sho
 					__event_srv_chk_r(cs);
 			}
 
-			task_set_affinity(t, tid_bit);
 			goto reschedule;
 
 		case SF_ERR_SRVTO: /* ETIMEDOUT */
@@ -2292,6 +2292,7 @@ static struct task *process_chk_conn(struct task *t, void *context, unsigned sho
 		}
 
 		/* here, we have seen a synchronous error, no fd was allocated */
+		task_set_affinity(t, MAX_THREADS_MASK);
 		if (cs) {
 			if (check->wait_list.events)
 				cs->conn->xprt->unsubscribe(cs->conn,
